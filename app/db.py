@@ -83,6 +83,44 @@ CREATE TABLE IF NOT EXISTS adjudication_version (
 
 CREATE INDEX IF NOT EXISTS idx_version_batch
     ON adjudication_version(batch_no, version);
+
+-- 出货核验单：同一单关联多个已登记生产批次
+CREATE TABLE IF NOT EXISTS shipment_doc (
+    doc_no               TEXT PRIMARY KEY,
+    status               TEXT NOT NULL,           -- DRAFT / CONFIRMED / REVIEW_PENDING
+    created_at           TEXT NOT NULL,
+    updated_at           TEXT NOT NULL,
+    verified_at          TEXT,                    -- 最近一次（重新）核验时间
+    confirmed_at         TEXT,                    -- 最近一次确认时间
+    review_pending_at    TEXT,                    -- 最近一次被裁决重算转为待复核的时间
+    review_reason        TEXT                     -- JSON：首个触发待复核的批次信息
+);
+
+-- 出货核验单逐批快照：保存核验当时的当前裁决版本与结论
+CREATE TABLE IF NOT EXISTS shipment_doc_item (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_no               TEXT NOT NULL REFERENCES shipment_doc(doc_no),
+    position             INTEGER NOT NULL,        -- 提交列表中的原始顺序
+    batch_no             TEXT NOT NULL REFERENCES batch(batch_no),
+    snapshot_version     INTEGER NOT NULL,        -- 核验当时的裁决版本
+    snapshot_disposition TEXT NOT NULL,           -- 核验当时的结论 RELEASE / HOLD
+    verified_at          TEXT NOT NULL,
+    UNIQUE(doc_no, batch_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sdi_doc ON shipment_doc_item(doc_no, position);
+CREATE INDEX IF NOT EXISTS idx_sdi_batch ON shipment_doc_item(batch_no);
+
+-- 历次确认快照（只追加；重新确认即再追加一条，历史确认记录全部保留）
+CREATE TABLE IF NOT EXISTS shipment_doc_confirmation (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_no         TEXT NOT NULL,
+    confirmed_at   TEXT NOT NULL,
+    revision       INTEGER NOT NULL,              -- 第几次确认（从 1 递增）
+    snapshot       TEXT NOT NULL                  -- JSON：确认时整单逐批快照
+);
+
+CREATE INDEX IF NOT EXISTS idx_sdc_doc ON shipment_doc_confirmation(doc_no, revision);
 """
 
 # 初始化空库时写入的参考原料批号（不影响裁决的演示样例）

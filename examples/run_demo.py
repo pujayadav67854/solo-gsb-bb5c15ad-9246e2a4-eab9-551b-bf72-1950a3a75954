@@ -12,6 +12,9 @@
   6. 更正 B2026003 开工前的清洁核验：确认清除上一批留下的 peanut
        -> B2026003 与后续 B2026004 按序重算，均变为放行
   7. 查询 B2026003 的历史裁决版本（v1 扣留 -> v2 放行）
+  8. 出货核验单：多批快照、原子确认、重算转待复核、重新核验后再次确认
+  9. 错误处理示例：重复批次号 / 无效过敏原 / 未知原料 / 更正不存在批次
+       + 未知批次 / 重复单号 / 重复批次 / HOLD 不能确认
 
 用法：
     python examples/run_demo.py            # 默认 http://127.0.0.1:8080
@@ -136,7 +139,62 @@ def main() -> int:
     show("B2026003 历史版本", status, history)
     print("  预期：v1=HOLD（REGISTER），v2=RELEASE（CORRECT_BATCH）。")
 
-    section("8. 错误处理示例：重复批次号 / 无效过敏原 / 未知原料 / 更正不存在批次")
+    # ------------------------------------------------------------ 出货核验单
+    section("8. 出货核验单：多批快照 / 原子确认 / 重算转待复核 / 重新核验")
+
+    def ensure_doc(doc_no: str, batch_nos: list[str]) -> tuple[int, dict]:
+        st, bd = call("POST", "/api/shipment-docs", {"doc_no": doc_no, "batch_nos": batch_nos})
+        if st == 409 and bd["error"]["code"] == "DUPLICATE_SHIPMENT_DOC":
+            print(f"  出货核验单 {doc_no} 已存在，复用现有单据继续演示")
+            st, bd = call("GET", f"/api/shipment-docs/{doc_no}")
+        else:
+            print(f"  已提交出货核验单 {doc_no}，关联批次：{batch_nos}")
+        return st, bd
+
+    # 8.1 单据 A：B2026003 + B2026004（更正后均为 RELEASE）
+    ensure_doc("SH-DEMO-OK", ["B2026003", "B2026004"])
+    status, doc = call("POST", "/api/shipment-docs/SH-DEMO-OK/confirm")
+    show("确认 SH-DEMO-OK（逐批均为当前版本且 RELEASE）", status, doc)
+    print("  预期：200，status=CONFIRMED，confirmation_revision=1。")
+
+    # 8.2 更正 B2026003 清洁核验（覆盖项不变，结论仍 RELEASE，但产生 v3）
+    status, rec = call("PUT", "/api/batches/B2026003/cleaning", {"cleaned_allergens": ["peanut"]})
+    show("再次提交相同清洁核验（结论仍 RELEASE，仅产生新裁决版本）", status, rec)
+
+    status, doc = call("GET", "/api/shipment-docs/SH-DEMO-OK")
+    show("查询 SH-DEMO-OK", status, doc)
+    print("  预期：status=REVIEW_PENDING（即使结论仍为 RELEASE），逐批 stale=true，"
+          "reverify_required=true。")
+
+    # 8.3 未重新核验直接确认 → REVERIFY_REQUIRED
+    status, body = call("POST", "/api/shipment-docs/SH-DEMO-OK/confirm")
+    print(f"[{status}] 未重新核验直接确认: {body['error']['code']} - {body['error']['message']}")
+    print("  预期：409 REVERIFY_REQUIRED，单据保持 REVIEW_PENDING。")
+
+    # 8.4 重新核验刷新逐批快照，随后再次确认
+    status, doc = call("POST", "/api/shipment-docs/SH-DEMO-OK/verify")
+    show("重新核验 SH-DEMO-OK（快照追上当前版本）", status, doc)
+    status, doc = call("POST", "/api/shipment-docs/SH-DEMO-OK/confirm")
+    show("再次确认 SH-DEMO-OK", status, doc)
+    print("  预期：200，status=CONFIRMED，confirmation_revision=2。")
+
+    # 8.5 历次确认快照只追加保留
+    status, confs = call("GET", "/api/shipment-docs/SH-DEMO-OK/confirmations")
+    show("SH-DEMO-OK 历次确认快照", status, confs)
+    print("  预期：revision 1 与 2 均保留，各自记录确认当时的逐批版本。")
+
+    # 8.6 单据 B：含 HOLD 批次 B2026002，始终不能确认
+    ensure_doc("SH-DEMO-HOLD", ["B2026001", "B2026002"])
+    status, body = call("POST", "/api/shipment-docs/SH-DEMO-HOLD/confirm")
+    print(f"[{status}] 确认含 HOLD 批次的单据: {body['error']['code']} - {body['error']['message']}")
+    for m in body["error"].get("mismatches", []):
+        print(f"    - 批次 {m['batch_no']}: 当前 {m['current_disposition']} "
+              f"(v{m['current_version']})，原因 {m['reasons']}")
+    print("  预期：409 VERIFICATION_MISMATCH，B2026002 原因为 HOLD_NOT_RELEASABLE，"
+          "单据保持 DRAFT。")
+
+    # 8.7 出货核验拒绝场景
+    section("9. 错误处理示例：批次/原料类 + 出货核验类")
     for label, method, path, payload in [
         ("重复批次号", "POST", "/api/batches", {
             "batch_no": "B2026001", "line_id": "L1",
@@ -153,9 +211,26 @@ def main() -> int:
         ("更正目标不存在", "PUT", "/api/batches/NO-SUCH-BATCH/cleaning", {
             "cleaned_allergens": ["milk"],
         }),
+        ("出货单关联未知批次", "POST", "/api/shipment-docs", {
+            "doc_no": "SH-BAD-UNKNOWN", "batch_nos": ["B2026001", "B-NOT-EXIST"],
+        }),
+        ("出货单批次列表重复", "POST", "/api/shipment-docs", {
+            "doc_no": "SH-BAD-DUP", "batch_nos": ["B2026001", "B2026001"],
+        }),
     ]:
         status, body = call(method, path, payload)
         print(f"[{status}] {label}: {body['error']['code']} - {body['error']['message']}")
+
+    # 重复出货核验单号
+    status, body = call(
+        "POST", "/api/shipment-docs",
+        {"doc_no": "SH-DEMO-OK", "batch_nos": ["B2026001"]},
+    )
+    print(f"[{status}] 出货核验单号重复: {body['error']['code']} - {body['error']['message']}")
+
+    section("10. 出货核验单列表（状态过滤）")
+    status, body = call("GET", "/api/shipment-docs")
+    show("全部出货核验单", status, body)
 
     section("完成")
     print("可继续在交互式文档中探索： %s/docs" % BASE_URL)

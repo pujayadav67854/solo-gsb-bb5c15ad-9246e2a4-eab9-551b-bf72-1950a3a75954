@@ -249,7 +249,76 @@ def recompute_from(
             }
         )
 
+    # 产生了新裁决版本：含这些批次的已确认/待复核出货核验单立即（继续）转待复核，
+    # 即使新结论仍为 RELEASE（待复核单须重新核验后才能再次确认）。
+    changed_batch_nos = [s["batch_no"] for s in summaries if s["version"] > 1]
+    if changed_batch_nos:
+        _mark_docs_for_review(conn, changed_batch_nos, trigger, _now())
+
     return summaries
+
+
+# ------------------------------------------------- 出货核验：待复核联动
+
+
+TRIGGER_REASON_TEXT = {
+    "REGISTER": "批次登记重算",
+    "CORRECT_BATCH": "批次更正重算",
+    "CORRECT_LOT": "原料批号更正重算",
+}
+
+
+def _trigger_reason(trigger: str) -> str:
+    return TRIGGER_REASON_TEXT.get(trigger, trigger or "裁决重算")
+
+
+def _mark_docs_for_review(conn, batch_nos: list[str], trigger: str, now: str) -> None:
+    """含已产生新裁决版本批次的非草稿出货核验单 → 立即转为待复核。
+
+    无论新结论是否仍为 RELEASE；已确认单的历次确认快照在
+    shipment_doc_confirmation 中只增保留，不受影响。
+    """
+    if not batch_nos:
+        return
+    placeholders = ",".join("?" * len(batch_nos))
+    docs = conn.execute(
+        f"""SELECT DISTINCT d.doc_no AS doc_no
+              FROM shipment_doc d
+              JOIN shipment_doc_item i ON i.doc_no = d.doc_no
+             WHERE i.batch_no IN ({placeholders})
+               AND d.status IN ('CONFIRMED', 'REVIEW_PENDING')""",
+        batch_nos,
+    ).fetchall()
+
+    for d in docs:
+        # 本单内首个发生变化的批次（按提交顺序）作为整单待复核原因
+        first = conn.execute(
+            f"""SELECT i.batch_no AS batch_no,
+                       a.version AS current_version,
+                       a.disposition AS disposition
+                  FROM shipment_doc_item i
+                  JOIN adjudication a ON a.batch_no = i.batch_no
+                 WHERE i.doc_no = ? AND i.batch_no IN ({placeholders})
+                 ORDER BY i.position
+                 LIMIT 1""",
+            (d["doc_no"], *batch_nos),
+        ).fetchone()
+        reason = {"trigger": trigger, "reason": _trigger_reason(trigger)}
+        if first is not None:
+            reason.update(
+                {
+                    "batch_no": first["batch_no"],
+                    "current_version": first["current_version"],
+                    "current_disposition": first["disposition"],
+                }
+            )
+        conn.execute(
+            """UPDATE shipment_doc
+                  SET status='REVIEW_PENDING', review_pending_at=?,
+                      review_reason=?, updated_at=?
+                WHERE doc_no=?""",
+            (now, dumps(reason), now, d["doc_no"]),
+        )
 
 
 # ---------------------------------------------------------------- 序列化
@@ -284,6 +353,183 @@ def _adj_payload(adj) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------- 服务入口
+
+
+def _normalize_batch_refs(values) -> list[str]:
+    """出货核验单批次列表：必须是非空字符串数组，且列表内不允许重复（保序）。"""
+    if not isinstance(values, list) or not values:
+        raise bad_request(
+            "INVALID_PAYLOAD", "字段 batch_nos 必须是非空且无重复的批次号数组"
+        )
+    if any(not isinstance(v, str) or not v.strip() for v in values):
+        raise bad_request(
+            "INVALID_PAYLOAD", "字段 batch_nos 必须是非空且无重复的批次号数组"
+        )
+    refs = [v.strip() for v in values]
+    seen: set[str] = set()
+    dupes: list[str] = []
+    for ref in refs:
+        if ref in seen and ref not in dupes:
+            dupes.append(ref)
+        seen.add(ref)
+    if dupes:
+        raise conflict(
+            "DUPLICATE_BATCH_IN_LIST", f"批次号在列表中重复: {', '.join(dupes)}"
+        )
+    return refs
+
+
+def _snapshot_batch(conn, batch_no: str) -> dict[str, Any]:
+    """读取批次当前裁决版本（核验/重新核验时逐批保存为快照）。"""
+    row = conn.execute(
+        """SELECT b.batch_no AS batch_no, b.line_id AS line_id, b.seq AS seq,
+                  a.version AS version, a.disposition AS disposition
+             FROM batch b JOIN adjudication a ON a.batch_no = b.batch_no
+            WHERE b.batch_no = ?""",
+        (batch_no,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "batch_no": row["batch_no"],
+        "line_id": row["line_id"],
+        "seq": row["seq"],
+        "version": row["version"],
+        "disposition": row["disposition"],
+    }
+
+
+def _replace_snapshot_items(conn, doc_no: str, batch_nos: list[str], now: str) -> None:
+    """用提交的批次列表及其当前裁决重建逐批快照（首次核验 / 重新核验共用）。"""
+    conn.execute("DELETE FROM shipment_doc_item WHERE doc_no = ?", (doc_no,))
+    for position, batch_no in enumerate(batch_nos, start=1):
+        snap = _snapshot_batch(conn, batch_no)
+        if snap is None:
+            raise bad_request("UNKNOWN_BATCH", f"批次未登记: {batch_no}")
+        conn.execute(
+            """INSERT INTO shipment_doc_item
+               (doc_no, position, batch_no, snapshot_version, snapshot_disposition, verified_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                doc_no,
+                position,
+                snap["batch_no"],
+                snap["version"],
+                snap["disposition"],
+                now,
+            ),
+        )
+
+
+def _item_change_reason(conn, item, current_version: int, current_disposition: str) -> str | None:
+    """快照版本落后于当前版本时的变化原因（取自新版本裁决版本记录）。"""
+    if current_version <= item["snapshot_version"]:
+        return None
+    row = conn.execute(
+        """SELECT trigger FROM adjudication_version
+            WHERE batch_no = ? AND version = ?""",
+        (item["batch_no"], current_version),
+    ).fetchone()
+    parts = [
+        f"{_trigger_reason(row['trigger'])}（{row['trigger']}）" if row else "裁决重算"
+    ]
+    if current_disposition != item["snapshot_disposition"]:
+        parts.append(
+            f"结论由 {item['snapshot_disposition']} 变为 {current_disposition}"
+        )
+    return "，".join(parts)
+
+
+def _load_doc_payload(conn, doc_row) -> dict[str, Any]:
+    """组装出货核验单快照：单据状态 + 逐批（快照版本/当前版本/是否落后/变化原因）。"""
+    items = conn.execute(
+        """SELECT i.*, a.version AS current_version, a.disposition AS current_disposition,
+                  b.line_id AS line_id, b.seq AS seq
+             FROM shipment_doc_item i
+             JOIN batch b ON b.batch_no = i.batch_no
+             JOIN adjudication a ON a.batch_no = i.batch_no
+            WHERE i.doc_no = ? ORDER BY i.position""",
+        (doc_row["doc_no"],),
+    ).fetchall()
+
+    batch_items = []
+    for it in items:
+        stale = it["current_version"] > it["snapshot_version"]
+        batch_items.append(
+            {
+                "position": it["position"],
+                "batch_no": it["batch_no"],
+                "line_id": it["line_id"],
+                "seq": it["seq"],
+                "snapshot_version": it["snapshot_version"],
+                "snapshot_disposition": it["snapshot_disposition"],
+                "current_version": it["current_version"],
+                "current_disposition": it["current_disposition"],
+                "stale": stale,
+                "change_reason": _item_change_reason(
+                    conn, it, it["current_version"], it["current_disposition"]
+                ),
+                "verified_at": it["verified_at"],
+            }
+        )
+
+    payload = {
+        "doc_no": doc_row["doc_no"],
+        "status": doc_row["status"],
+        "batch_count": len(batch_items),
+        "created_at": doc_row["created_at"],
+        "updated_at": doc_row["updated_at"],
+        "verified_at": doc_row["verified_at"],
+        "confirmed_at": doc_row["confirmed_at"],
+        "review_pending_at": doc_row["review_pending_at"],
+        "review_reason": loads(doc_row["review_reason"]) if doc_row["review_reason"] else None,
+        "reverify_required": False,
+        "items": batch_items,
+    }
+    if doc_row["status"] == "REVIEW_PENDING":
+        payload["reverify_required"] = not (
+            doc_row["verified_at"]
+            and doc_row["review_pending_at"]
+            and doc_row["verified_at"] >= doc_row["review_pending_at"]
+        )
+    return payload
+
+
+def _doc_mismatches(conn, doc_no: str) -> list[dict[str, Any]]:
+    """确认前原子校验：逐批比对快照版本与当前版本、当前结论。"""
+    items = conn.execute(
+        """SELECT i.*, a.version AS current_version, a.disposition AS current_disposition
+             FROM shipment_doc_item i
+             JOIN adjudication a ON a.batch_no = i.batch_no
+            WHERE i.doc_no = ? ORDER BY i.position""",
+        (doc_no,),
+    ).fetchall()
+    mismatches = []
+    for it in items:
+        stale = it["current_version"] > it["snapshot_version"]
+        hold = it["current_disposition"] != "RELEASE"
+        if not stale and not hold:
+            continue
+        if stale:
+            reasons = ["STALE_SNAPSHOT"]
+            if hold:
+                reasons.append("HOLD_NOT_RELEASABLE")
+        else:
+            reasons = ["HOLD_NOT_RELEASABLE"]
+        mismatches.append(
+            {
+                "batch_no": it["batch_no"],
+                "snapshot_version": it["snapshot_version"],
+                "current_version": it["current_version"],
+                "snapshot_disposition": it["snapshot_disposition"],
+                "current_disposition": it["current_disposition"],
+                "reasons": reasons,
+                "change_reason": _item_change_reason(
+                    conn, it, it["current_version"], it["current_disposition"]
+                ),
+            }
+        )
+    return mismatches
 
 
 class Service:
@@ -584,5 +830,235 @@ class Service:
                         "decided_at": v["decided_at"],
                     }
                     for v in versions
+                ],
+            }
+
+    # ---- 出货核验单 ----
+
+    def create_shipment_doc(self, doc_no: str, batch_nos: list[str]) -> dict[str, Any]:
+        """提交出货核验：唯一单号 + 非空、无重复的已登记批次号列表。
+
+        保存逐批“当前裁决版本 + 结论”快照，单据状态为 DRAFT。
+        未知批次 / 重复单号 / 重复批次一律拒绝，整事务回滚不留部分单据。
+        """
+        doc_no = (doc_no or "").strip()
+        if not doc_no:
+            raise bad_request("INVALID_PAYLOAD", "doc_no 不能为空")
+        batches = _normalize_batch_refs(batch_nos)
+
+        with self.store.write() as conn:
+            if conn.execute(
+                "SELECT 1 FROM shipment_doc WHERE doc_no = ?", (doc_no,)
+            ).fetchone():
+                raise conflict("DUPLICATE_SHIPMENT_DOC", f"出货核验单号重复: {doc_no}")
+
+            # 先校验全部批次存在，再插入单据（失败即回滚，不留下部分单据）
+            placeholders = ",".join("?" * len(batches))
+            known = {
+                r["batch_no"]
+                for r in conn.execute(
+                    f"SELECT batch_no FROM batch WHERE batch_no IN ({placeholders})",
+                    batches,
+                ).fetchall()
+            }
+            unknown = [b for b in batches if b not in known]
+            if unknown:
+                raise bad_request(
+                    "UNKNOWN_BATCH", f"批次未登记: {', '.join(unknown)}"
+                )
+
+            now = _now()
+            conn.execute(
+                """INSERT INTO shipment_doc
+                   (doc_no, status, created_at, updated_at, verified_at,
+                    confirmed_at, review_pending_at, review_reason)
+                   VALUES (?, 'DRAFT', ?, ?, ?, NULL, NULL, NULL)""",
+                (doc_no, now, now, now),
+            )
+            _replace_snapshot_items(conn, doc_no, batches, now)
+            row = conn.execute(
+                "SELECT * FROM shipment_doc WHERE doc_no = ?", (doc_no,)
+            ).fetchone()
+            payload = _load_doc_payload(conn, row)
+        return payload
+
+    def reverify_shipment_doc(self, doc_no: str) -> dict[str, Any]:
+        """（重新）核验：刷新逐批快照为各批次当前裁决版本。
+
+        仅草稿或待复核单据可核验；已确认单据不可重新核验
+        （其含批次发生重算时会自动转为待复核）。
+        """
+        doc_no = (doc_no or "").strip()
+        with self.store.write() as conn:
+            doc = conn.execute(
+                "SELECT * FROM shipment_doc WHERE doc_no = ?", (doc_no,)
+            ).fetchone()
+            if not doc:
+                raise not_found(
+                    "SHIPMENT_DOC_NOT_FOUND", f"出货核验单不存在: {doc_no}"
+                )
+            if doc["status"] == "CONFIRMED":
+                raise conflict(
+                    "INVALID_DOC_STATUS",
+                    "已确认单据无需重新核验；仅草稿或待复核单据可重新核验",
+                )
+
+            items = conn.execute(
+                "SELECT batch_no FROM shipment_doc_item WHERE doc_no = ? ORDER BY position",
+                (doc_no,),
+            ).fetchall()
+            now = _now()
+            _replace_snapshot_items(conn, doc_no, [i["batch_no"] for i in items], now)
+            conn.execute(
+                "UPDATE shipment_doc SET verified_at=?, updated_at=? WHERE doc_no=?",
+                (now, now, doc_no),
+            )
+            payload = _load_doc_payload(
+                conn,
+                conn.execute(
+                    "SELECT * FROM shipment_doc WHERE doc_no = ?", (doc_no,)
+                ).fetchone(),
+            )
+        return payload
+
+    def confirm_shipment_doc(self, doc_no: str) -> dict[str, Any]:
+        """确认出货核验单。
+
+        原子校验：每个逐批快照版本必须仍是当前版本，且当前结论全部为 RELEASE。
+        不符则保持未确认（草稿/待复核）并返回逐批不符批次及原因；
+        HOLD 批次始终不能确认；待复核单据必须先重新核验才能再次确认。
+        """
+        doc_no = (doc_no or "").strip()
+        with self.store.write() as conn:
+            doc = conn.execute(
+                "SELECT * FROM shipment_doc WHERE doc_no = ?", (doc_no,)
+            ).fetchone()
+            if not doc:
+                raise not_found(
+                    "SHIPMENT_DOC_NOT_FOUND", f"出货核验单不存在: {doc_no}"
+                )
+
+            mismatches = _doc_mismatches(conn, doc_no)
+
+            # 待复核单据：必须经重新核验刷新快照后才能再次确认
+            if doc["status"] == "REVIEW_PENDING":
+                needs_reverify = not (
+                    doc["verified_at"]
+                    and doc["review_pending_at"]
+                    and doc["verified_at"] >= doc["review_pending_at"]
+                )
+                if needs_reverify:
+                    raise conflict(
+                        "REVERIFY_REQUIRED",
+                        "单据处于待复核状态，须重新核验刷新逐批快照后才能再次确认",
+                        {"mismatches": mismatches},
+                    )
+
+            if mismatches:
+                raise conflict(
+                    "VERIFICATION_MISMATCH",
+                    "快照版本已过期或存在 HOLD 批次，单据保持未确认",
+                    {"mismatches": mismatches},
+                )
+
+            now = _now()
+            revision_row = conn.execute(
+                "SELECT COALESCE(MAX(revision), 0) AS max_rev "
+                "FROM shipment_doc_confirmation WHERE doc_no = ?",
+                (doc_no,),
+            ).fetchone()
+            revision = revision_row["max_rev"] + 1
+
+            payload = _load_doc_payload(conn, doc)
+            # 只追加保留历次确认快照
+            conn.execute(
+                """INSERT INTO shipment_doc_confirmation
+                   (doc_no, confirmed_at, revision, snapshot)
+                   VALUES (?, ?, ?, ?)""",
+                (doc_no, now, revision, dumps(payload)),
+            )
+            conn.execute(
+                """UPDATE shipment_doc
+                      SET status='CONFIRMED', confirmed_at=?,
+                          review_pending_at=NULL, review_reason=NULL, updated_at=?
+                    WHERE doc_no=?""",
+                (now, now, doc_no),
+            )
+            result = _load_doc_payload(
+                conn,
+                conn.execute(
+                    "SELECT * FROM shipment_doc WHERE doc_no = ?", (doc_no,)
+                ).fetchone(),
+            )
+            result["confirmation_revision"] = revision
+        return result
+
+    def get_shipment_doc(self, doc_no: str) -> dict[str, Any]:
+        doc_no = (doc_no or "").strip()
+        with self.store.read() as conn:
+            doc = conn.execute(
+                "SELECT * FROM shipment_doc WHERE doc_no = ?", (doc_no,)
+            ).fetchone()
+            if not doc:
+                raise not_found(
+                    "SHIPMENT_DOC_NOT_FOUND", f"出货核验单不存在: {doc_no}"
+                )
+            return _load_doc_payload(conn, doc)
+
+    def list_shipment_docs(self, status: str | None = None) -> dict[str, Any]:
+        with self.store.read() as conn:
+            if status is not None:
+                status = status.strip().upper()
+                if status not in {"DRAFT", "CONFIRMED", "REVIEW_PENDING"}:
+                    raise bad_request(
+                        "INVALID_PAYLOAD",
+                        "status 必须是 DRAFT / CONFIRMED / REVIEW_PENDING 之一",
+                    )
+                rows = conn.execute(
+                    "SELECT * FROM shipment_doc WHERE status = ? ORDER BY doc_no",
+                    (status,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM shipment_doc ORDER BY doc_no"
+                ).fetchall()
+            docs = []
+            for r in rows:
+                p = _load_doc_payload(conn, r)
+                docs.append(
+                    {k: p[k] for k in (
+                        "doc_no", "status", "batch_count", "created_at",
+                        "updated_at", "verified_at", "confirmed_at",
+                        "review_pending_at", "review_reason", "reverify_required",
+                    )}
+                )
+            return {"shipment_docs": docs}
+
+    def shipment_doc_confirmations(self, doc_no: str) -> dict[str, Any]:
+        """查询出货核验单历次确认快照（只追加，全部保留）。"""
+        doc_no = (doc_no or "").strip()
+        with self.store.read() as conn:
+            doc = conn.execute(
+                "SELECT 1 FROM shipment_doc WHERE doc_no = ?", (doc_no,)
+            ).fetchone()
+            if not doc:
+                raise not_found(
+                    "SHIPMENT_DOC_NOT_FOUND", f"出货核验单不存在: {doc_no}"
+                )
+            rows = conn.execute(
+                """SELECT revision, confirmed_at, snapshot
+                     FROM shipment_doc_confirmation
+                    WHERE doc_no = ? ORDER BY revision""",
+                (doc_no,),
+            ).fetchall()
+            return {
+                "doc_no": doc_no,
+                "confirmations": [
+                    {
+                        "revision": r["revision"],
+                        "confirmed_at": r["confirmed_at"],
+                        "snapshot": loads(r["snapshot"]),
+                    }
+                    for r in rows
                 ],
             }

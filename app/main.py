@@ -13,6 +13,7 @@ from .schemas import (
     CleaningCorrection,
     MaterialLotCorrection,
     MaterialLotIn,
+    ShipmentDocIn,
 )
 from .service import Service
 
@@ -24,7 +25,7 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
             "面向共用产线的生产批次过敏原换线放行：登记原料批号与批次、"
             "计算残留传递与未声明过敏原，给出放行/扣留裁决；支持更正重算与历史版本查询。"
         ),
-        version="1.0.0",
+        version="1.1.0",
     )
 
     store = Store(db_path or config.DB_PATH)
@@ -35,9 +36,12 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
 
     @app.exception_handler(APIError)
     async def handle_api_error(_: Request, exc: APIError) -> JSONResponse:
+        error: dict[str, object] = {"code": exc.code, "message": exc.message}
+        if exc.details is not None:
+            error.update(exc.details)
         return JSONResponse(
             status_code=exc.status_code,
-            content={"error": {"code": exc.code, "message": exc.message}},
+            content={"error": error},
         )
 
     def svc() -> Service:
@@ -118,6 +122,38 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
     def batch_history(batch_no: str, service: Service = Depends(svc)):
         """查询某批次历次裁决版本（可审计的历史裁决）。"""
         return service.batch_history(batch_no)
+
+    # ---------------- 出货核验单 ----------------
+
+    @app.post("/api/shipment-docs", tags=["出货核验"], status_code=201)
+    def create_shipment_doc(body: ShipmentDocIn, service: Service = Depends(svc)):
+        """提交出货核验单（唯一单号 + 非空、无重复的已登记批次号列表），返回核验单快照。"""
+        return service.create_shipment_doc(body.doc_no, body.batch_nos)
+
+    @app.get("/api/shipment-docs", tags=["出货核验"])
+    def list_shipment_docs(status: str | None = None, service: Service = Depends(svc)):
+        """列出出货核验单（可按 status=DRAFT/CONFIRMED/REVIEW_PENDING 过滤）。"""
+        return service.list_shipment_docs(status)
+
+    @app.get("/api/shipment-docs/{doc_no}", tags=["出货核验"])
+    def get_shipment_doc(doc_no: str, service: Service = Depends(svc)):
+        """查询单据状态、逐批记录版本/当前版本/是否落后及变化原因。"""
+        return service.get_shipment_doc(doc_no)
+
+    @app.post("/api/shipment-docs/{doc_no}/verify", tags=["出货核验"])
+    def reverify_shipment_doc(doc_no: str, service: Service = Depends(svc)):
+        """草稿重新核验 / 待复核单据重新核验：刷新逐批快照。"""
+        return service.reverify_shipment_doc(doc_no)
+
+    @app.post("/api/shipment-docs/{doc_no}/confirm", tags=["出货核验"])
+    def confirm_shipment_doc(doc_no: str, service: Service = Depends(svc)):
+        """原子确认：快照版本须仍为当前版本且全部 RELEASE；否则返回不符批次及原因并保持未确认。"""
+        return service.confirm_shipment_doc(doc_no)
+
+    @app.get("/api/shipment-docs/{doc_no}/confirmations", tags=["出货核验"])
+    def shipment_doc_confirmations(doc_no: str, service: Service = Depends(svc)):
+        """查询历次确认快照（只追加，全部保留）。"""
+        return service.shipment_doc_confirmations(doc_no)
 
     return app
 
