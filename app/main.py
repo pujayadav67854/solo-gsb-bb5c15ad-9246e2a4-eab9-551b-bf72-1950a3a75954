@@ -13,6 +13,7 @@ from .schemas import (
     CleaningCorrection,
     MaterialLotCorrection,
     MaterialLotIn,
+    VerificationIn,
 )
 from .service import Service
 
@@ -35,9 +36,12 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
 
     @app.exception_handler(APIError)
     async def handle_api_error(_: Request, exc: APIError) -> JSONResponse:
+        error: dict = {"code": exc.code, "message": exc.message}
+        if exc.details is not None:
+            error["details"] = exc.details
         return JSONResponse(
             status_code=exc.status_code,
-            content={"error": {"code": exc.code, "message": exc.message}},
+            content={"error": error},
         )
 
     def svc() -> Service:
@@ -118,6 +122,39 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
     def batch_history(batch_no: str, service: Service = Depends(svc)):
         """查询某批次历次裁决版本（可审计的历史裁决）。"""
         return service.batch_history(batch_no)
+
+    # ---------------- 出货核验单 ----------------
+
+    @app.post("/api/verifications", tags=["出货核验单"], status_code=201)
+    def create_verification(body: VerificationIn, service: Service = Depends(svc)):
+        """创建出货核验单（草稿）：唯一单号 + 非空、无重复的已登记批次号列表。
+
+        逐批保存创建时的当前裁决版本与结论；未知批次、重复单号/批次均整体拒绝。
+        """
+        return service.create_verification(body.verification_no, body.batch_nos)
+
+    @app.get("/api/verifications", tags=["出货核验单"])
+    def list_verifications(status: str | None = None, service: Service = Depends(svc)):
+        """列出出货核验单（可按 DRAFT / PENDING_REVIEW / CONFIRMED 过滤）。"""
+        return service.list_verifications(status)
+
+    @app.get("/api/verifications/{verification_no}", tags=["出货核验单"])
+    def get_verification(verification_no: str, service: Service = Depends(svc)):
+        """查询核验单状态、逐批记录（快照版本/当前版本/变化原因）与历次确认快照。"""
+        return service.get_verification(verification_no)
+
+    @app.post("/api/verifications/{verification_no}/reverify", tags=["出货核验单"])
+    def reverify_verification(verification_no: str, service: Service = Depends(svc)):
+        """重新核验：刷新逐批快照并回到草稿（草稿/待复核可用；已确认拒绝）。"""
+        return service.reverify_verification(verification_no)
+
+    @app.post("/api/verifications/{verification_no}/confirm", tags=["出货核验单"])
+    def confirm_verification(verification_no: str, service: Service = Depends(svc)):
+        """确认：原子校验逐批快照仍为当前版本且全部 RELEASE。
+
+        不符时返回 422 与不符批次明细（STALE_SNAPSHOT / BATCH_ON_HOLD），单据保持未确认。
+        """
+        return service.confirm_verification(verification_no)
 
     return app
 

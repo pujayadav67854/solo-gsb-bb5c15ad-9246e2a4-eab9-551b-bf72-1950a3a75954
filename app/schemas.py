@@ -31,3 +31,8 @@ class BatchCorrection(BaseModel):
 
 class CleaningCorrection(BaseModel):
     cleaned_allergens: list[str] = Field(..., description="重新核验后确认已清除的过敏原代码全集")
+
+
+class VerificationIn(BaseModel):
+    verification_no: str = Field(..., description="出货核验单号（唯一）")
+    batch_nos: list[str] = Field(..., min_length=1, description="关联的已登记生产批次号列表；非空、不可重复，按提交顺序保存")

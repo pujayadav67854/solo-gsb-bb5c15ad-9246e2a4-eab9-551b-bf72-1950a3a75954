@@ -83,6 +83,56 @@ CREATE TABLE IF NOT EXISTS adjudication_version (
 
 CREATE INDEX IF NOT EXISTS idx_version_batch
     ON adjudication_version(batch_no, version);
+
+-- 出货核验单：一张单据关联多个已登记生产批次，逐批保存裁决快照
+CREATE TABLE IF NOT EXISTS verification (
+    verification_no  TEXT PRIMARY KEY,
+    status           TEXT NOT NULL,             -- DRAFT / PENDING_REVIEW / CONFIRMED
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    confirmed_at     TEXT
+);
+
+-- 核验单逐批快照：创建/重新核验时记录当时的裁决版本与结论
+CREATE TABLE IF NOT EXISTS verification_batch (
+    verification_no      TEXT NOT NULL REFERENCES verification(verification_no),
+    batch_no             TEXT NOT NULL REFERENCES batch(batch_no),
+    position             INTEGER NOT NULL,      -- 按提交顺序保序
+    snapshot_version     INTEGER NOT NULL,
+    snapshot_disposition TEXT NOT NULL,         -- RELEASE / HOLD
+    snapshot_actual      TEXT NOT NULL DEFAULT '[]',
+    snapshot_undeclared  TEXT NOT NULL DEFAULT '[]',
+    snapshot_reasons     TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (verification_no, batch_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vbatch_batch ON verification_batch(batch_no);
+
+-- 历次确认（只追加；单据转待复核/重新核验后可再次确认，历史确认不覆盖）
+CREATE TABLE IF NOT EXISTS verification_confirmation (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    verification_no  TEXT NOT NULL REFERENCES verification(verification_no),
+    confirmed_at     TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vconf_verification
+    ON verification_confirmation(verification_no);
+
+-- 每次确认时逐批快照的不可变副本
+CREATE TABLE IF NOT EXISTS verification_confirmation_batch (
+    confirmation_id      INTEGER NOT NULL REFERENCES verification_confirmation(id),
+    verification_no      TEXT NOT NULL REFERENCES verification(verification_no),
+    position             INTEGER NOT NULL,
+    batch_no             TEXT NOT NULL,
+    snapshot_version     INTEGER NOT NULL,
+    snapshot_disposition TEXT NOT NULL,
+    snapshot_actual      TEXT NOT NULL DEFAULT '[]',
+    snapshot_undeclared  TEXT NOT NULL DEFAULT '[]',
+    snapshot_reasons     TEXT NOT NULL DEFAULT '[]'
+);
+
+CREATE INDEX IF NOT EXISTS idx_vcb_confirmation
+    ON verification_confirmation_batch(confirmation_id);
 """
 
 # 初始化空库时写入的参考原料批号（不影响裁决的演示样例）
@@ -176,13 +226,15 @@ def initialize(store: Store, seed_demo: bool = False) -> None:
     assert store._conn is not None
     conn = store._conn
     fresh = store.is_fresh()
-    # DDL：autocommit 状态执行，IF NOT EXISTS 保证幂等
+    # DDL：autocommit 状态执行，IF NOT EXISTS 保证幂等；
+    # 旧库升级时也必须执行，以便补齐后续版本新增的表。
     conn.executescript(SCHEMA)
     with store.write():
         conn.executemany(
             "INSERT OR IGNORE INTO allergen(code, name_zh) VALUES (?, ?)",
             list(al.ALLERGENS.items()),
         )
+        # 演示数据仅在全新空库写入；过敏原字典每次幂等补齐
         if seed_demo and fresh:
             now = datetime.now(UTC).isoformat()
             conn.execute(
